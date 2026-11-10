@@ -200,6 +200,8 @@ export interface PaneInfo {
   program: Program;
   focused: boolean;
   zoomed: boolean;
+  /** Folded into a label strip on this screen (pane.collapse). */
+  collapsed: boolean;
   /** The app's top-center grip can rearrange this pane. False when zoomed or alone. */
   movable: boolean;
 }

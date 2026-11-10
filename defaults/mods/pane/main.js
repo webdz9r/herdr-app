@@ -1,7 +1,7 @@
 // A pane's header, for layouts that frame their panes:
 //   { "tab": "active", "pane": { "header": { "content": { "mod": "pane" } } } }
 // Shows the program's icon (the app's program table), the agent's name or
-// the terminal's title, the folder, and the agent's status; buttons split, zoom and close
+// the terminal's title, the folder, and the agent's status; buttons split, collapse, zoom and close
 // this pane. Props from the app: { pane, terminal }. Click: focus the pane.
 
 import { View, div, svg, image } from "gpui-kit";
@@ -87,6 +87,7 @@ export default class Pane extends View {
       .when(this.hovered, el => el
         .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
         .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
+        .when(panes().filter((q) => q.tab === p.tab).length > 1, el => el.child(this.button(t, `ph-c-${pane}`, "collapse", "pane.collapse", { pane })))
         .child(this.button(t, `ph-z-${pane}`, p.zoomed ? "unzoom" : "zoom", "pane.zoom", { pane }))
         .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane })));
   }

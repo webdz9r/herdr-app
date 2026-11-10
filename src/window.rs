@@ -1736,7 +1736,7 @@ impl AppWindow {
                     let zoomed = ctx.zoomed.as_deref() == Some(p.id.as_str());
                     // A mod pane: what it shows, no terminal.
                     if let Some(Content::Mod { name, .. }) = p.content() {
-                        panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
+                        panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "collapsed": ctx.is_collapsed(&p.id), "movable": self.pane_movable(&p.id) }));
                         continue;
                     }
                     let Some(addr) = p.terminal() else { continue };
@@ -1748,7 +1748,7 @@ impl AppWindow {
                         "pane": p.id, "terminal": addr, "tab": ctx.id, "title": title.clone().unwrap_or_default(),
                         "cwd": self.cwds.get(addr), "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
                         "status": m.status(addr), "app": a.and_then(|a| a.app.clone()), "program": self.program(addr),
-                        "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id),
+                        "focused": focused, "zoomed": zoomed, "collapsed": ctx.is_collapsed(&p.id), "movable": self.pane_movable(&p.id),
                     }));
                     let Some(status) = m.status(addr) else { continue };
                     agents.push(json!({
@@ -3040,7 +3040,23 @@ impl AppWindow {
                     && let Some(c) = self.model.tab_mut(&ctx)
                     && c.root.panes().len() > 1
                 {
+                    c.collapsed.remove(&pane);
                     c.zoomed = if c.zoomed.as_deref() == Some(pane.as_str()) { None } else { Some(pane) };
+                }
+            }
+            "pane.collapse" => {
+                let Some(pane) = Self::owned(a, "pane").or_else(|| self.model.focused_pane()) else { return self.fail("no pane to collapse") };
+                let Some(tab) = self.model.tab_of(&pane).map(|c| c.id.clone()) else { return self.fail(format!("no pane {pane:?}")) };
+                match self.model.tab_mut(&tab).map(|c| c.toggle_collapse(&pane)) {
+                    Some(Ok(collapsed)) => {
+                        // Focus may have moved off the pane that folded away.
+                        self.focused_block = None;
+                        self.focused_pane = None;
+                        self.agent = self.model.focused_pane().and_then(|p| self.model.address_of(&p));
+                        self.answer(Ok(json!({ "pane": pane, "collapsed": collapsed })));
+                    }
+                    Some(Err(why)) => self.fail(format!("pane.collapse: {why}")),
+                    None => self.fail(format!("no pane {pane:?}")),
                 }
             }
             "pane.focus" => {
@@ -4056,6 +4072,7 @@ impl AppWindow {
             el = self.window_drag(el, cx);
         }
         let el = match &n.kind {
+            Kind::Block { .. } if self.model.tab_of(&n.id).is_some_and(|t| t.is_collapsed(&n.id)) => el.child(self.collapsed_strip(n, cx)),
             Kind::Block { content } => {
                 let inner = self.render_block(n, content, focused, cx);
                 match frame.filter(|_| n.is_pane()) {
@@ -4111,6 +4128,72 @@ impl AppWindow {
         el.children(self.render_floats(n, cx)).children(self.pane_grip(&n.id, row, cx)).into_any_element()
     }
 
+    /// A collapsed pane: its program, folder and agent status on a strip. A click opens it.
+    fn collapsed_strip(&self, n: &Node, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.model.tab_of(&n.id);
+        let side = tab.and_then(|t| t.root.parent_of(&n.id)).and_then(Node::axis) == Some(Axis::Row);
+        let addr = n.terminal();
+        let program = addr.map(|a| self.program(a)).unwrap_or(Value::Null);
+        let title = addr
+            .and_then(|a| self.terms.get(&n.id).map(|t| t.view.read(cx).title.clone()).or_else(|| self.live.get(a).and_then(|r| r.get("title")).and_then(Value::as_str).map(str::to_owned)))
+            .unwrap_or_default();
+        let flag = |key: &str| program.get(key).and_then(Value::as_bool).unwrap_or(false);
+        let program_name = program.get("name").and_then(Value::as_str).unwrap_or("shell");
+        // What it is: an agent or shell by its program, else the terminal's own title.
+        let name = if flag("agent") || flag("shell") || title.is_empty() { program_name.to_owned() } else { title };
+        let home = home();
+        let cwd = addr.and_then(|a| self.cwds.get(a)).map(|d| {
+            let d = std::path::Path::new(d);
+            match d.strip_prefix(&home) {
+                Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+                Ok(rest) => format!("~/{}", rest.display()),
+                Err(_) => d.display().to_string(),
+            }
+        });
+        let dot = addr.and_then(|a| self.model.status(a)).map(|s| match s {
+            "working" => c("working"),
+            "blocked" => c("blocked"),
+            "done" => c("done"),
+            _ => c("idle"),
+        });
+        let pane = n.id.clone();
+        let mut strip = div()
+            .id(SharedString::from(format!("strip-{}", n.id)))
+            .size_full()
+            .flex()
+            .overflow_hidden()
+            .bg(c("raised"))
+            .border(px(1.0))
+            .border_color(c("input"))
+            .rounded(px(6.0))
+            .text_size(settings::z(12.0))
+            .text_color(c("foreground"))
+            .cursor_pointer()
+            .hover(|s| s.bg(c("hover")).border_color(c("accent")))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.run("pane.collapse", json!({ "pane": pane }), window, cx);
+            }));
+        let dot = dot.map(|color| div().flex_none().size(settings::z(8.0)).rounded(px(4.0)).bg(color));
+        if side {
+            // Beside other panes: a narrow column. Status on top, then the folder's name
+            // (the program's, for a pane with no folder) stacked downward.
+            let label = cwd.as_deref().map(|d| d.rsplit('/').next().unwrap_or(d).to_owned()).filter(|d| !d.is_empty()).unwrap_or(name);
+            strip = strip.flex_col().items_center().gap(settings::z(5.0)).py(settings::z(10.0));
+            strip = strip.children(dot);
+            for ch in label.chars().take(24) {
+                strip = strip.child(div().flex_none().font_weight(FontWeight::MEDIUM).child(ch.to_string()));
+            }
+        } else {
+            // Stacked: one line like the pane header, program then folder.
+            strip = strip.flex_row().items_center().gap(settings::z(8.0)).px(settings::z(10.0));
+            strip = strip.children(dot).child(div().flex_none().max_w(settings::z(260.0)).truncate().font_weight(FontWeight::MEDIUM).child(name));
+            if let Some(d) = cwd {
+                strip = strip.child(div().flex_1().truncate().text_color(c("muted")).child(d));
+            }
+        }
+        strip.into_any_element()
+    }
+
     fn render_block(&self, n: &Node, content: &Content, focused: &HashSet<String>, cx: &mut Context<Self>) -> AnyElement {
         match content {
             Content::Terminal { .. } => match self.pane_term(&n.id) {
@@ -4152,7 +4235,7 @@ impl AppWindow {
                     .into_any_element(),
             },
             Content::Context { .. } => match self.model.active_tab() {
-                Some(c) => self.render_node(c.shown(), focused, self.pane_frame(), cx),
+                Some(c) => self.render_node(&c.display(), focused, self.pane_frame(), cx),
                 None if self.documents.get("").is_some_and(|s| s.layout() == "loading") => div().size_full().into_any_element(),
                 None => {
                     let key = crate::keys::listing().into_iter().find(|(_, _, a)| a == "space.new").map(|(_, k, _)| format!(" ({k})"));
@@ -4675,7 +4758,7 @@ fn swap_by(args: &Value) -> Result<SwapBy<'_>, String> {
 
 fn needs_model_pane(name: &str, args: &Value) -> bool {
     match name {
-        "pane.split" | "pane.close" | "pane.zoom" | "pane.swap" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
+        "pane.split" | "pane.close" | "pane.zoom" | "pane.collapse" | "pane.swap" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
         "pane.go" => true,
         "terminal.open" | "terminal.keep" => matches!(AppWindow::arg(args, "place"), Some("right" | "down")),
         _ => false,
@@ -6167,11 +6250,11 @@ export default class SystemToast extends View {
     #[test]
     fn composition_commands_never_default_to_a_source_pane() {
         use serde_json::json;
-        for name in ["pane.split", "pane.close", "pane.zoom", "pane.go", "pane.swap", "terminal.show"] {
+        for name in ["pane.split", "pane.close", "pane.zoom", "pane.collapse", "pane.go", "pane.swap", "terminal.show"] {
             assert!(super::needs_model_pane(name, &json!({})), "{name}");
             assert!(super::needs_model_pane(name, &json!({"pane": null})), "{name}");
         }
-        for name in ["pane.split", "pane.close", "pane.zoom", "pane.swap", "terminal.show"] {
+        for name in ["pane.split", "pane.close", "pane.zoom", "pane.collapse", "pane.swap", "terminal.show"] {
             assert!(!super::needs_model_pane(name, &json!({"pane": "explicit-pane"})), "{name}");
         }
         assert!(super::needs_model_pane("pane.go", &json!({"pane": "explicit-pane"})));

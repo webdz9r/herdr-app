@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 
+/// A collapsed pane beside others is this wide (px at zoom 1); stacked, this tall.
+pub const STRIP_WIDTH: f32 = 40.0;
+pub const STRIP_HEIGHT: f32 = 30.0;
+
 /// A named piece of work in a space: its terminals and how they're split.
 #[derive(Clone, Debug)]
 pub struct Tab {
@@ -19,6 +23,9 @@ pub struct Tab {
     /// Panes focused before, most recent last: closing the focused pane goes back.
     pub before: Vec<String>,
     pub zoomed: Option<String>,
+    /// Panes folded into a label strip on this screen (`pane.collapse`). Their
+    /// terminals keep their size; the split's other panes take the room.
+    pub collapsed: std::collections::BTreeSet<String>,
     /// Put away (ms since the epoch): out of the lists, still running. Comes
     /// back when it's shown or one of its agents needs the person.
     pub settled: Option<u64>,
@@ -120,6 +127,7 @@ impl Tab {
             before: Vec::new(),
             root: Node::container(id, Axis::Row, vec![pane]),
             zoomed: None,
+            collapsed: Default::default(),
             settled: None,
             rest: Default::default(),
         }
@@ -128,6 +136,8 @@ impl Tab {
     /// Focuses a pane and remembers the one it leaves. A zoomed tab shows the
     /// pane it focuses, never a hidden one.
     pub fn focus(&mut self, pane: &str) {
+        // A collapsed pane that gets the keyboard opens again.
+        self.collapsed.remove(pane);
         if self.zoomed.is_some() {
             self.zoomed = Some(pane.to_owned());
         }
@@ -149,6 +159,64 @@ impl Tab {
     /// What's drawn: only the zoomed pane when one is zoomed.
     pub fn shown(&self) -> &Node {
         self.zoomed.as_deref().and_then(|z| self.root.find(z)).unwrap_or(&self.root)
+    }
+
+    /// What's drawn, with collapsed panes cut to their strip: a fixed width in a
+    /// row, a fixed height in a column. Weights are left alone, so opening one again
+    /// gives back the share it had.
+    pub fn display(&self) -> std::borrow::Cow<'_, Node> {
+        use std::borrow::Cow;
+        let shown = self.shown();
+        if self.zoomed.is_some() || self.collapsed.is_empty() {
+            return Cow::Borrowed(shown);
+        }
+        let mut tree = shown.clone();
+        for id in &self.collapsed {
+            let axis = tree.parent_of(id).and_then(Node::axis);
+            if let (Some(axis), Some(n)) = (axis, tree.find_mut(id)) {
+                n.size = Some(crate::layout::Size::Px { px: if axis == Axis::Row { STRIP_WIDTH } else { STRIP_HEIGHT } });
+                n.min = None;
+                n.max = None;
+            }
+        }
+        Cow::Owned(tree)
+    }
+
+    /// Whether `pane` is a label strip on this screen. A zoomed tab shows its one pane open.
+    pub fn is_collapsed(&self, pane: &str) -> bool {
+        self.zoomed.is_none() && self.collapsed.contains(pane)
+    }
+
+    /// Why `pane` can't be collapsed, if it can't: it needs a split with a
+    /// neighbor that stays open to take its room.
+    pub fn collapse_error(&self, pane: &str) -> Option<&'static str> {
+        if !self.root.find(pane).is_some_and(Node::is_pane) {
+            return Some("not a pane of this tab");
+        }
+        let Some(parent) = self.root.parent_of(pane) else { return Some("no split to collapse in") };
+        let open = parent.children().iter().filter(|c| !c.hidden && c.id != pane).any(|c| !self.collapsed.contains(&c.id));
+        (!open).then_some("every other pane of its split is collapsed")
+    }
+
+    /// Folds `pane` into a strip, or opens it again. Focus moves off a collapsed
+    /// pane, to the pane focused before it that's still open, else any open one.
+    pub fn toggle_collapse(&mut self, pane: &str) -> Result<bool, &'static str> {
+        if self.collapsed.remove(pane) {
+            return Ok(false);
+        }
+        if let Some(why) = self.collapse_error(pane) {
+            return Err(why);
+        }
+        self.collapsed.insert(pane.to_owned());
+        if self.focused.as_deref() == Some(pane) {
+            let open = |id: &String| self.root.find(id).is_some_and(Node::is_pane) && !self.collapsed.contains(id);
+            let next = self.before.iter().rev().find(|id| open(id)).cloned().or_else(|| self.root.panes().iter().map(|n| n.id.clone()).find(open));
+            if let Some(next) = next {
+                self.before.retain(|p| *p != next);
+                self.focused = Some(next);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -361,6 +429,7 @@ impl Model {
         if c.zoomed.as_deref() == Some(pane_id) {
             c.zoomed = None;
         }
+        c.collapsed.remove(pane_id);
         if !c.root.panes().is_empty() {
             c.before.retain(|p| p != pane_id);
             if c.focused.as_deref() == Some(pane_id) {
@@ -702,6 +771,75 @@ mod tests {
         let mut m = Model::default();
         m.add_space("p1", "api", "/src/api", Tab::new("c1", "fix login", "x1", "t1"));
         m
+    }
+
+    fn split_in_three() -> Model {
+        // x1 | (x2 over x3), so there is a row split and a column split.
+        let mut m = model_with_one();
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.split("x2", Axis::Column, "x3", "t3");
+        m
+    }
+
+    #[test]
+    fn collapsing_cuts_a_pane_to_a_strip_and_keeps_its_share() {
+        use crate::layout::Size;
+        let mut m = split_in_three();
+        let before = m.tab("c1").unwrap().root.find("x1").unwrap().size;
+        assert_eq!(m.tab_mut("c1").unwrap().toggle_collapse("x1"), Ok(true));
+        let tab = m.tab("c1").unwrap();
+        assert!(tab.is_collapsed("x1"));
+        let shown = tab.display();
+        assert_eq!(shown.find("x1").unwrap().size, Some(Size::Px { px: STRIP_WIDTH }));
+        // Stacked panes fold to a bar, not a column.
+        let mut m2 = split_in_three();
+        assert_eq!(m2.tab_mut("c1").unwrap().toggle_collapse("x3"), Ok(true));
+        assert_eq!(m2.tab("c1").unwrap().display().find("x3").unwrap().size, Some(Size::Px { px: STRIP_HEIGHT }));
+        // The tree itself is untouched, so opening gives the old share back.
+        assert_eq!(tab.root.find("x1").unwrap().size, before);
+        assert_eq!(m.tab_mut("c1").unwrap().toggle_collapse("x1"), Ok(false));
+        assert_eq!(m.tab("c1").unwrap().display().find("x1").unwrap().size, before);
+    }
+
+    #[test]
+    fn a_pane_needs_an_open_neighbor_in_its_split() {
+        let mut m = split_in_three();
+        let tab = m.tab_mut("c1").unwrap();
+        // Alone in the tab: nothing to give its room to.
+        let mut one = Tab::new("solo", "x", "only", "t9");
+        assert!(one.toggle_collapse("only").is_err());
+        // x2 and x3 share a column; folding x2 leaves x3 open, folding x3 as well is refused.
+        assert_eq!(tab.toggle_collapse("x2"), Ok(true));
+        assert!(tab.toggle_collapse("x3").is_err());
+        assert!(!tab.is_collapsed("x3"));
+        assert!(tab.toggle_collapse("nope").is_err());
+    }
+
+    #[test]
+    fn collapsing_the_focused_pane_moves_focus_and_focusing_opens_a_pane() {
+        let mut m = split_in_three();
+        let tab = m.tab_mut("c1").unwrap();
+        tab.focus("x1");
+        tab.focus("x2");
+        assert_eq!(tab.toggle_collapse("x2"), Ok(true));
+        // Back to the pane focused before it.
+        assert_eq!(tab.focused.as_deref(), Some("x1"));
+        tab.focus("x2");
+        assert!(!tab.is_collapsed("x2"));
+    }
+
+    #[test]
+    fn closing_a_pane_or_zooming_forgets_its_collapse() {
+        let mut m = split_in_three();
+        m.tab_mut("c1").unwrap().toggle_collapse("x1").unwrap();
+        // A zoomed tab shows its pane open and draws no strips.
+        m.tab_mut("c1").unwrap().zoomed = Some("x2".into());
+        assert!(!m.tab("c1").unwrap().is_collapsed("x1"));
+        assert!(matches!(m.tab("c1").unwrap().display(), std::borrow::Cow::Borrowed(_)));
+        m.tab_mut("c1").unwrap().zoomed = None;
+        assert!(m.tab("c1").unwrap().is_collapsed("x1"));
+        m.remove_pane("x1");
+        assert!(m.tab("c1").unwrap().collapsed.is_empty());
     }
 
     #[test]

@@ -369,9 +369,9 @@ The tab block says how each pane of the shown tab is wrapped:
   pane has the keyboard; `gap` is the space between panes.
 - `header`: a mod drawn on each pane, one copy per pane, with
   `props().pane` and `props().terminal`. It reads its live facts from
-  `panes()` (title, folder, branch, agent status, focused, zoomed) and its
-  buttons run pane commands with that pane (`pane.split`, `pane.zoom`,
-  `pane.close`). `position`: `top` or `bottom`; `reveal: "hover"` shows it
+  `panes()` (title, folder, branch, agent status, focused, zoomed, collapsed) and its
+  buttons run pane commands with that pane (`pane.split`, `pane.collapse`,
+  `pane.zoom`, `pane.close`). `position`: `top` or `bottom`; `reveal: "hover"` shows it
   only while the pointer is on the pane, drawn over the terminal so the
   terminal never resizes. The shipped `pane` mod keeps its divider on the
   terminal-facing edge and reads the frame position from `layout()`.
@@ -568,7 +568,11 @@ The main ones:
   skip settled tabs).
 - Panes: `pane.split {direction: "right" | "down", pane?, argv? | mod?, props?}` (a new
   terminal, or a mod pane), `pane.close {pane?}`,
-  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`,
+  `pane.zoom {pane?}`, `pane.collapse {pane?}` (fold a pane into a label strip, 40 px wide
+  beside others or 30 px tall when stacked, and give its room to its neighbors; again:
+  open it. Per screen, like zoom. The terminal keeps its size while folded. Focusing or
+  zooming it opens it; a pane needs a neighbor in its split that stays open),
+  `pane.focus {pane | terminal}`, `pane.go {direction}`,
   `pane.swap {pane?, direction | target}`.
   `pane.go` prefers the most recently focused pane along the nearest edge in that
   direction; unvisited panes fall back to overlap, then top/left layout order.

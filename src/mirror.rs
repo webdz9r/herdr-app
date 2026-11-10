@@ -55,6 +55,8 @@ struct TabView {
     focused: Option<String>,
     before: Vec<String>,
     zoomed: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    collapsed: Vec<String>,
     settled: Option<u64>,
 }
 
@@ -136,7 +138,7 @@ impl Document {
                 .map(|t| {
                     let mut root = t.root.clone();
                     map_node(&mut root, &map);
-                    Tab { id: map(&t.id), name: t.name.clone(), root, focused: None, before: vec![], zoomed: None, settled: None, rest: t.rest.clone() }
+                    Tab { id: map(&t.id), name: t.name.clone(), root, focused: None, before: vec![], zoomed: None, collapsed: Default::default(), settled: None, rest: t.rest.clone() }
                 })
                 .collect(),
             rest: s.rest.clone(),
@@ -153,7 +155,7 @@ impl View {
             active: model.active.clone(),
             recent: model.recent.clone(),
             spaces: model.spaces.iter().map(|s| (s.id.clone(), s.active.clone())).collect(),
-            tabs: model.tabs().map(|t| (t.id.clone(), TabView { focused: t.focused.clone(), before: t.before.clone(), zoomed: t.zoomed.clone(), settled: t.settled })).collect(),
+            tabs: model.tabs().map(|t| (t.id.clone(), TabView { focused: t.focused.clone(), before: t.before.clone(), zoomed: t.zoomed.clone(), collapsed: t.collapsed.iter().cloned().collect(), settled: t.settled })).collect(),
             attention: model.agents.iter().map(|(a, s)| (a.clone(), Seen { word: s.word.clone(), seen: s.seen })).collect(),
         }
     }
@@ -208,6 +210,7 @@ impl View {
                 if let Some(v) = self.tabs.get(&t.id) {
                     t.focused = v.focused.clone().filter(|id| t.root.find(id).is_some());
                     t.zoomed = v.zoomed.clone().filter(|id| t.root.find(id).is_some());
+                    t.collapsed = v.collapsed.iter().filter(|id| t.root.find(id).is_some_and(Node::is_pane)).cloned().collect();
                     t.before = v.before.iter().filter(|id| t.root.find(id).is_some()).cloned().collect();
                     t.settled = v.settled;
                 }
@@ -247,6 +250,26 @@ mod tests {
         view.apply(&mut other);
         assert_eq!(other.tab("t").unwrap().zoomed.as_deref(), Some("p"));
         assert_eq!(other.tab("t").unwrap().settled, Some(12));
+    }
+    #[test]
+    fn collapsed_panes_are_kept_per_screen_and_never_shared() {
+        let mut m = model();
+        m.split("p", Axis::Row, "q", "t2");
+        m.tab_mut("t").unwrap().toggle_collapse("q").unwrap();
+        // The shared document doesn't carry it: capturing before and after opening is the same.
+        let folded = Document::capture(&m, None);
+        m.tab_mut("t").unwrap().collapsed.clear();
+        assert_eq!(folded, Document::capture(&m, None));
+        m.tab_mut("t").unwrap().toggle_collapse("q").unwrap();
+        // This screen's view does, and drops ids that are gone.
+        let view = View::capture(&m);
+        let mut other = Model::default();
+        Document::capture(&m, None).replace(&mut other, None);
+        view.apply(&mut other);
+        assert!(other.tab("t").unwrap().collapsed.contains("q"));
+        other.remove_pane("q");
+        view.apply(&mut other);
+        assert!(other.tab("t").unwrap().collapsed.is_empty());
     }
     #[test]
     fn remote_roundtrip_qualifies_only_identity_not_mod_props() {

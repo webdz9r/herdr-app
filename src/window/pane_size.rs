@@ -137,7 +137,7 @@ impl AppWindow {
     /// The grid `pane` gets when `tab` is the one shown.
     pub(super) fn shown_size(&self, tab: &Tab, pane: &str, window: &Window) -> Option<(u16, u16)> {
         let focused = tab.focused_pane().and_then(|f| tab.root.path_to(&f)).unwrap_or_default().into_iter().collect();
-        self.displayed_size(tab.shown(), tab.root.panes().len(), pane, &focused, window)
+        self.displayed_size(&tab.display(), tab.root.panes().len(), pane, &focused, window)
     }
 
     /// `shown`: the tree on screen; `panes`: how many the tab has (its frame needs more than one, or `lone`).
@@ -182,6 +182,10 @@ impl AppWindow {
         let active = self.model.active_tab().map(|t| t.id.clone());
         for tab in self.model.tabs().filter(|t| Some(&t.id) != active.as_ref()) {
             for pane in tab.shown().panes() {
+                // A collapsed pane isn't drawn, so its terminal keeps the size it had.
+                if tab.is_collapsed(&pane.id) {
+                    continue;
+                }
                 if let Some(t) = self.terms.get(&pane.id)
                     && let Some((cols, rows)) = self.shown_size(tab, &pane.id, window)
                 {
